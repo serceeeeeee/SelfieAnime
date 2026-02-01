@@ -1,0 +1,644 @@
+# 0. Setup & Config
+import sys, os, warnings, random
+import numpy as np
+from PIL import Image
+import cv2
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms, utils as vutils, models
+
+print('Python:', sys.version)
+print('PyTorch:', torch.__version__)
+print('CUDA available:', torch.cuda.is_available())
+if torch.cuda.is_available():
+    print('GPU:', torch.cuda.get_device_name(0))
+
+warnings.filterwarnings("ignore")
+torch.backends.cudnn.benchmark = True
+
+try:
+    from google.colab import drive
+    drive.mount('/content/drive')
+except Exception as e:
+    print('Drive mount skipped:', e)
+
+
+# 1. Config
+class Cfg:
+    # 路径
+    data_root = '/content/drive/MyDrive/selfie2anime'
+    out_dir   = '/content/outputs_anime_cyclegan'
+    os.makedirs(out_dir, exist_ok=True)
+
+    img_size   = 256
+    batch_size = 2
+    num_workers= 2
+
+    # 训练设置
+    epochs     = 100
+    lr_G       = 2e-4
+    lr_D       = 2e-4
+    betas      = (0.5, 0.999)
+    decay_epoch= 50         # 从第 50 个 epoch 开始线性衰减学习率
+
+    # 损失权重
+    lambda_gan      = 2.0
+    lambda_cycle    = 8.0
+    lambda_identity = 3.0   # 只对 G_A2B(B) 做 identity
+
+    # VGG 感知（内容）损失：real_A vs fake_B
+    use_vgg         = True
+    lambda_content  = 0.05
+
+    # TV 平滑损失（压裂纹）
+    lambda_tv       = 5e-4
+
+    # ImagePool 大小
+    pool_size       = 50
+
+    seed  = 42
+
+cfg = Cfg()
+
+# 固定随机数种子
+torch.manual_seed(cfg.seed)
+np.random.seed(cfg.seed)
+random.seed(cfg.seed)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(cfg.seed)
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print('Device:', device)
+
+
+# 2. 工具函数 & 颜色后处理
+def denorm(x):
+    """[-1, 1] -> [0, 1]"""
+    return (x + 1.0) / 2.0
+
+def tensor2img(x):
+    x = denorm(x)
+    x = x.clamp(0, 1).cpu().numpy()
+    if x.shape[0] == 3:
+        x = np.transpose(x, (1, 2, 0))
+    x = (x * 255).astype(np.uint8)
+    return x
+
+def adjust_brightness_contrast(img, alpha=1.1, beta=5):
+    """简单亮度/对比度调整，让颜色更像插画"""
+    return cv2.convertScaleAbs(img, alpha=alpha, beta=beta)
+
+def apply_anime_color(img):
+    """
+    推理时可选的颜色后处理，让颜色更接近“赛璐璐”风格
+    """
+    lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
+    l, a, b = cv2.split(lab)
+
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+    l = clahe.apply(l)
+
+    a = cv2.multiply(a, 1.1)
+    b = cv2.multiply(b, 1.1)
+
+    lab = cv2.merge([l, a, b])
+    result = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+    return result
+
+def total_variation_loss(img):
+    """
+    总变差损失：抑制高频噪点和棋盘/裂纹伪影
+    img: (B, C, H, W)
+    """
+    loss = torch.mean(torch.abs(img[:, :, :, :-1] - img[:, :, :, 1:])) + \
+           torch.mean(torch.abs(img[:, :, :-1, :] - img[:, :, 1:, :]))
+    return loss
+
+def vgg_preprocess(x):
+    """
+    VGG19 输入预处理：[-1,1] -> ImageNet 标准化
+    """
+    x = denorm(x)  # [0,1]
+    mean = torch.tensor([0.485, 0.456, 0.406], device=x.device).view(1, 3, 1, 1)
+    std  = torch.tensor([0.229, 0.224, 0.225], device=x.device).view(1, 3, 1, 1)
+    return (x - mean) / std
+
+
+# 3. Dataset
+
+
+class AnimeDataset(Dataset):
+    """
+    Unpaired A(真人) / B(动漫) 数据集
+    结构：
+      root/
+        trainA/*.jpg
+        trainB/*.jpg
+    """
+    def __init__(self, root, mode='train'):
+        super().__init__()
+        self.root = root
+
+        self.A_dir = os.path.join(root, f'{mode}A')
+        self.B_dir = os.path.join(root, f'{mode}B')
+
+        def list_images(d):
+            if not os.path.exists(d):
+                return []
+            exts = ('.jpg','.jpeg','.png','.webp')
+            return sorted(
+                [os.path.join(d, x) for x in os.listdir(d)
+                 if x.lower().endswith(exts)]
+            )
+
+        self.A_paths = list_images(self.A_dir)
+        self.B_paths = list_images(self.B_dir)
+        self.A_size  = len(self.A_paths)
+        self.B_size  = len(self.B_paths)
+
+        if self.A_size == 0 or self.B_size == 0:
+            raise FileNotFoundError(f"No images in {self.A_dir} or {self.B_dir}")
+
+        # 直接 resize：避免 RandomCrop 把脸裁残
+        self.transform = transforms.Compose([
+            transforms.Resize((cfg.img_size, cfg.img_size)),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5,0.5,0.5), (0.5,0.5,0.5))
+        ])
+
+    def __len__(self):
+        return max(self.A_size, self.B_size)
+
+    def __getitem__(self, idx):
+        A_path = self.A_paths[idx % self.A_size]
+        B_path = self.B_paths[np.random.randint(0, self.B_size)]
+
+        A = Image.open(A_path).convert('RGB')
+        B = Image.open(B_path).convert('RGB')
+
+        A = self.transform(A)
+        B = self.transform(B)
+        return A, B
+
+train_dataset = AnimeDataset(cfg.data_root, mode='train')
+train_loader  = DataLoader(
+    train_dataset,
+    batch_size=cfg.batch_size,
+    shuffle=True,
+    num_workers=cfg.num_workers,
+    drop_last=True
+)
+print(f"Training samples: {len(train_dataset)}")
+
+
+# 4. 模型：ResNet Generator & PatchGAN Discriminator
+class ResnetBlock(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        block = [
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(dim, dim, kernel_size=3, padding=0),
+            nn.InstanceNorm2d(dim, affine=True),
+            nn.ReLU(True),
+
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(dim, dim, kernel_size=3, padding=0),
+            nn.InstanceNorm2d(dim, affine=True)
+        ]
+        self.block = nn.Sequential(*block)
+
+    def forward(self, x):
+        out = x + self.block(x)
+        return out
+
+class ResnetGenerator(nn.Module):
+    """
+    ResNet 生成器
+    上采样改为 Upsample + Conv，缓解棋盘/裂纹伪影
+    """
+    def __init__(self, input_nc=3, output_nc=3, ngf=64, n_blocks=9):
+        assert n_blocks >= 1
+        super().__init__()
+
+        model = [
+            nn.ReflectionPad2d(3),
+            nn.Conv2d(input_nc, ngf, kernel_size=7, padding=0),
+            nn.InstanceNorm2d(ngf, affine=True),
+            nn.ReLU(True)
+        ]
+
+        # downsampling
+        n_downsampling = 2
+        mult = 1
+        for _ in range(n_downsampling):
+            model += [
+                nn.Conv2d(ngf * mult, ngf * mult * 2,
+                          kernel_size=3, stride=2, padding=1),
+                nn.InstanceNorm2d(ngf * mult * 2, affine=True),
+                nn.ReLU(True)
+            ]
+            mult *= 2
+
+        # ResNet blocks
+        for _ in range(n_blocks):
+            model += [ResnetBlock(ngf * mult)]
+
+        # upsampling: Upsample + Conv 替代 ConvTranspose2d
+        for _ in range(n_downsampling):
+            model += [
+                nn.Upsample(scale_factor=2, mode='nearest'),
+                nn.Conv2d(ngf * mult, int(ngf * mult / 2),
+                          kernel_size=3, stride=1, padding=1),
+                nn.InstanceNorm2d(int(ngf * mult / 2), affine=True),
+                nn.ReLU(True)
+            ]
+            mult //= 2
+
+        model += [
+            nn.ReflectionPad2d(3),
+            nn.Conv2d(ngf, output_nc, kernel_size=7, padding=0),
+            nn.Tanh()
+        ]
+
+        self.model = nn.Sequential(*model)
+
+    def forward(self, x):
+        return self.model(x)
+
+from torch.nn.utils import spectral_norm
+
+class NLayerDiscriminator(nn.Module):
+    """
+    70x70 PatchGAN 判别器 + SpectralNorm
+    """
+    def __init__(self, input_nc=3, ndf=64, n_layers=3):
+        super().__init__()
+        kw = 4
+        padw = 1
+        sequence = [
+            spectral_norm(
+                nn.Conv2d(input_nc, ndf, kernel_size=kw,
+                          stride=2, padding=padw)
+            ),
+            nn.LeakyReLU(0.2, True)
+        ]
+
+        nf_mult = 1
+        nf_mult_prev = 1
+        for n in range(1, n_layers):
+            nf_mult_prev = nf_mult
+            nf_mult = min(2**n, 8)
+            sequence += [
+                spectral_norm(
+                    nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult,
+                              kernel_size=kw, stride=2, padding=padw)
+                ),
+                nn.InstanceNorm2d(ndf * nf_mult, affine=True),
+                nn.LeakyReLU(0.2, True)
+            ]
+
+        nf_mult_prev = nf_mult
+        nf_mult = min(2**n_layers, 8)
+        sequence += [
+            spectral_norm(
+                nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult,
+                          kernel_size=kw, stride=1, padding=padw)
+            ),
+            nn.InstanceNorm2d(ndf * nf_mult, affine=True),
+            nn.LeakyReLU(0.2, True)
+        ]
+
+        sequence += [
+            spectral_norm(
+                nn.Conv2d(ndf * nf_mult, 1, kernel_size=kw,
+                          stride=1, padding=padw)
+            )
+        ]
+
+        self.model = nn.Sequential(*sequence)
+
+    def forward(self, x):
+        return self.model(x)
+
+# 权重初始化 
+
+def init_weights(net, gain=0.02):
+    def init_func(m):
+        classname = m.__class__.__name__
+        if hasattr(m, 'weight') and \
+           (classname.find('Conv') != -1 or classname.find('Linear') != -1):
+            nn.init.normal_(m.weight.data, 0.0, gain)
+            if hasattr(m, 'bias') and m.bias is not None:
+                nn.init.constant_(m.bias.data, 0.0)
+        elif classname.find('InstanceNorm2d') != -1:
+            if hasattr(m, 'weight') and m.weight is not None:
+                nn.init.normal_(m.weight.data, 1.0, gain)
+            if hasattr(m, 'bias') and m.bias is not None:
+                nn.init.constant_(m.bias.data, 0.0)
+    print(f'Initialize network {net.__class__.__name__}')
+    net.apply(init_func)
+
+# 实例化模型
+G_A2B = ResnetGenerator().to(device)  # selfie -> anime
+G_B2A = ResnetGenerator().to(device)  # anime  -> selfie (仅用于 cycle，不对外推理)
+D_A   = NLayerDiscriminator().to(device)  # 判别 A 域（真人）
+D_B   = NLayerDiscriminator().to(device)  # 判别 B 域（动漫）
+
+for net in [G_A2B, G_B2A, D_A, D_B]:
+    init_weights(net)
+
+print(f"Generator params: {sum(p.numel() for p in G_A2B.parameters())/1e6:.2f}M")
+
+
+# 5. Loss, VGG, ImagePool & Optimizers
+class GANLoss(nn.Module):
+    """
+    Least Squares GAN (LSGAN) 损失
+    """
+    def __init__(self):
+        super().__init__()
+        self.loss = nn.MSELoss()
+
+    def get_target(self, pred, target_is_real):
+        if target_is_real:
+            return torch.ones_like(pred, device=pred.device)
+        else:
+            return torch.zeros_like(pred, device=pred.device)
+
+    def forward(self, pred, target_is_real):
+        target = self.get_target(pred, target_is_real)
+        return self.loss(pred, target)
+
+gan_loss = GANLoss().to(device)
+L1 = nn.L1Loss()
+
+class VGG19Content(nn.Module):
+    """
+    VGG19 内容特征提取，用于 real_A vs fake_B 的结构约束
+    """
+    def __init__(self, layers=(2, 7, 12, 21)):
+        super().__init__()
+        try:
+            vgg = models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1)
+        except Exception:
+            vgg = models.vgg19(pretrained=True)
+        feats = vgg.features
+        self.layers = set(layers)
+        self.slice = nn.ModuleList()
+        for i in range(max(layers) + 1):
+            self.slice.append(feats[i])
+        for p in self.parameters():
+            p.requires_grad = False
+
+    def forward(self, x):
+        feats = []
+        for i, layer in enumerate(self.slice):
+            x = layer(x)
+            if i in self.layers:
+                feats.append(x)
+        return feats
+
+vgg_content = None
+if cfg.use_vgg:
+    vgg_content = VGG19Content().to(device)
+    vgg_content.eval()
+    print("Loaded VGG19 for content loss.")
+else:
+    print("VGG content loss disabled.")
+
+class ImagePool:
+    """
+    CycleGAN 中的 image buffer：
+    保存最近一些 fake 图，训练 D 时用新老混合，减小振荡。
+    """
+    def __init__(self, pool_size=50):
+        self.pool_size = pool_size
+        self.images = []
+
+    def query(self, images):
+        if self.pool_size <= 0:
+            return images
+
+        return_images = []
+        for i in range(images.size(0)):
+            img = images[i:i+1]
+            if len(self.images) < self.pool_size:
+                self.images.append(img.clone())
+                return_images.append(img)
+            else:
+                if random.random() > 0.5:
+                    idx = random.randint(0, self.pool_size - 1)
+                    tmp = self.images[idx].clone()
+                    self.images[idx] = img.clone()
+                    return_images.append(tmp)
+                else:
+                    return_images.append(img)
+        return torch.cat(return_images, dim=0)
+
+# 优化器
+G_optim = torch.optim.Adam(
+    list(G_A2B.parameters()) + list(G_B2A.parameters()),
+    lr=cfg.lr_G, betas=cfg.betas
+)
+D_optim = torch.optim.Adam(
+    list(D_A.parameters()) + list(D_B.parameters()),
+    lr=cfg.lr_D, betas=cfg.betas
+)
+
+def lambda_rule(epoch):
+    lr_l = 1.0 - max(0, epoch + 1 - cfg.decay_epoch) \
+                 / float(max(1, cfg.epochs - cfg.decay_epoch + 1))
+    return lr_l
+
+G_scheduler = torch.optim.lr_scheduler.LambdaLR(G_optim, lr_lambda=lambda_rule)
+D_scheduler = torch.optim.lr_scheduler.LambdaLR(D_optim, lr_lambda=lambda_rule)
+
+
+# 6. Training Loop
+
+
+print("\n" + "="*60)
+print("Start training Selfie2Anime CycleGAN")
+print("="*60 + "\n")
+
+fake_A_pool = ImagePool(pool_size=cfg.pool_size)
+fake_B_pool = ImagePool(pool_size=cfg.pool_size)
+
+for epoch in range(cfg.epochs):
+    G_A2B.train(); G_B2A.train()
+    D_A.train();   D_B.train()
+
+    for i, (real_A, real_B) in enumerate(train_loader):
+        real_A = real_A.to(device)
+        real_B = real_B.to(device)
+
+        # 6.1 Train Generators
+        G_optim.zero_grad()
+
+        # Identity：只对 G_A2B(B)
+        idt_B = G_A2B(real_B)
+        loss_idt = L1(idt_B, real_B) * cfg.lambda_identity
+
+        # GAN: A->B
+        fake_B = G_A2B(real_A)
+        pred_fake_B = D_B(fake_B)
+        loss_G_A2B = gan_loss(pred_fake_B, True) * cfg.lambda_gan
+
+        # GAN: B->A（仅用于 cycle）
+        fake_A = G_B2A(real_B)
+        pred_fake_A = D_A(fake_A)
+        loss_G_B2A = gan_loss(pred_fake_A, True) * cfg.lambda_gan
+
+        # Cycle
+        rec_A = G_B2A(fake_B)
+        rec_B = G_A2B(fake_A)
+        loss_cycle_A = L1(rec_A, real_A)
+        loss_cycle_B = L1(rec_B, real_B)
+        loss_cycle   = (loss_cycle_A + loss_cycle_B) * cfg.lambda_cycle
+
+        # VGG 内容损失：real_A vs fake_B
+        if cfg.use_vgg and vgg_content is not None and cfg.lambda_content > 0:
+            feats_real_A = vgg_content(vgg_preprocess(real_A))
+            feats_fake_B = vgg_content(vgg_preprocess(fake_B))
+            loss_content = torch.tensor(0.0, device=device)
+            for fr, ff in zip(feats_real_A, feats_fake_B):
+                loss_content = loss_content + L1(ff, fr)
+            loss_content = loss_content * cfg.lambda_content
+        else:
+            loss_content = torch.tensor(0.0, device=device)
+
+        # TV：抑制裂纹
+        loss_tv = total_variation_loss(fake_B) * cfg.lambda_tv
+
+        loss_G = loss_G_A2B + loss_G_B2A + loss_cycle + loss_idt + loss_content + loss_tv
+        loss_G.backward()
+        G_optim.step()
+
+        # 6.2 Train Discriminators
+        D_optim.zero_grad()
+
+        # D_A：真人域
+        pred_real_A = D_A(real_A)
+        loss_D_A_real = gan_loss(pred_real_A, True)
+
+        fake_A_det = fake_A.detach()
+        fake_A_det = fake_A_pool.query(fake_A_det)
+        pred_fake_A = D_A(fake_A_det)
+        loss_D_A_fake = gan_loss(pred_fake_A, False)
+
+        loss_D_A = 0.5 * (loss_D_A_real + loss_D_A_fake)
+
+        # D_B：动漫域
+        pred_real_B = D_B(real_B)
+        loss_D_B_real = gan_loss(pred_real_B, True)
+
+        fake_B_det = fake_B.detach()
+        fake_B_det = fake_B_pool.query(fake_B_det)
+        pred_fake_B = D_B(fake_B_det)
+        loss_D_B_fake = gan_loss(pred_fake_B, False)
+
+        loss_D_B = 0.5 * (loss_D_B_real + loss_D_B_fake)
+
+        loss_D = loss_D_A + loss_D_B
+        loss_D.backward()
+        D_optim.step()
+
+        if i % 50 == 0:
+            print(f"[Epoch {epoch+1:03d}/{cfg.epochs}] "
+                  f"[Batch {i:04d}/{len(train_loader)}] "
+                  f"G: {loss_G.item():.3f} "
+                  f"D: {loss_D.item():.3f} "
+                  f"(cyc: {loss_cycle.item():.3f}, "
+                  f"idt: {loss_idt.item():.3f}, "
+                  f"cont: {loss_content.item():.3f}, "
+                  f"tv: {loss_tv.item():.5f})")
+
+    G_scheduler.step()
+    D_scheduler.step()
+
+
+    # 6.3 保存示例图（只展示 A->B，人像 -> 动漫）
+    if (epoch+1) % 2 == 0 or epoch == 0:
+        with torch.no_grad():
+            G_A2B.eval()
+            A_sample, _ = next(iter(train_loader))
+            A_sample = A_sample.to(device)
+
+            fake_B_sample = G_A2B(A_sample)
+
+            grid = torch.cat(
+                [A_sample[:2],
+                 fake_B_sample[:2]],
+                dim=0
+            )
+            vutils.save_image(
+                denorm(grid),
+                os.path.join(cfg.out_dir,
+                             f'epoch_{epoch+1:03d}.jpg'),
+                nrow=2
+            )
+            print(f"Saved samples to epoch_{epoch+1:03d}.jpg")
+
+    # 6.4 保存 checkpoint
+    if (epoch+1) % 10 == 0 or (epoch+1) == cfg.epochs:
+        ckpt_path = os.path.join(cfg.out_dir,
+                                 f'checkpoint_{epoch+1:03d}.pth')
+        torch.save({
+            'G_A2B': G_A2B.state_dict(),
+            'G_B2A': G_B2A.state_dict(),
+            'D_A': D_A.state_dict(),
+            'D_B': D_B.state_dict(),
+            'epoch': epoch+1
+        }, ckpt_path)
+        print(f"Saved checkpoint: {ckpt_path}")
+
+print("\nTraining finished.")
+
+
+# 7. 推理函数：单张 selfie -> anime
+@torch.no_grad()
+def anime_transform(image_path, output_path,
+                    checkpoint_path=None,
+                    use_color_post=True):
+    """
+    使用训练好的 G_A2B 将单张真人照片转为动漫风格。
+    只提供「人像 -> 动漫」接口，没有「动漫 -> 人像」。
+    """
+    # load weights
+    if checkpoint_path is not None and os.path.exists(checkpoint_path):
+        ckpt = torch.load(checkpoint_path, map_location=device)
+        G_A2B.load_state_dict(ckpt['G_A2B'])
+        print(f"Loaded checkpoint from {checkpoint_path}")
+    else:
+        print("Warning: checkpoint_path not found, using current G_A2B weights")
+
+    G_A2B.eval()
+
+    tfm = transforms.Compose([
+        transforms.Resize((cfg.img_size, cfg.img_size)),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5,0.5,0.5), (0.5,0.5,0.5))
+    ])
+
+    img = Image.open(image_path).convert('RGB')
+    inp = tfm(img).unsqueeze(0).to(device)
+
+    fake_B = G_A2B(inp)
+    out_img = tensor2img(fake_B[0])
+
+    if use_color_post:
+        out_img = apply_anime_color(out_img)
+        out_img = adjust_brightness_contrast(out_img, alpha=1.2, beta=10)
+
+    Image.fromarray(out_img).save(output_path)
+    print(f"Saved anime image to: {output_path}")
+    return out_img
+
+print("\nUsage example (after some epochs):")
+print("anime_transform('/content/input.jpg', "
+      "'/content/output_anime.jpg', "
+      "checkpoint_path=f'{cfg.out_dir}/checkpoint_050.pth')")
